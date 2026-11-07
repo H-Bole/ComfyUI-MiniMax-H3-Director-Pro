@@ -629,6 +629,50 @@ function directorValueWidgets(node) {
     return [...new Set(widgets)].filter(isDirectorValueWidget);
 }
 
+function isTimelineDataValue(value) {
+    if (typeof value !== "string" || !value.trim()) return false;
+    try {
+        const parsed = JSON.parse(value);
+        return !!parsed && typeof parsed === "object" && !Array.isArray(parsed);
+    } catch {
+        return false;
+    }
+}
+
+function cloneDirectorWidgetValue(value) {
+    if (value == null) return null;
+    if (typeof value !== "object") return value;
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return value;
+    }
+}
+
+/**
+ * A saved value may come from widgets_values_named (newer workflows) or from
+ * widgets_values (legacy positional). Never let an invalid placeholder such as
+ * `{}` overwrite a valid value of the type the widget expects.
+ */
+function isUsableDirectorValue(name, value, widget, def) {
+    if (value === undefined || value === null) return false;
+    if (name === "timeline_data") return isTimelineDataValue(value);
+    if (typeof def === "string") {
+        if (typeof value !== "string") return false;
+        const options = widget?.options?.values;
+        if (Array.isArray(options) && options.length && !options.includes(value)) return false;
+        return true;
+    }
+    if (typeof def === "number") return typeof value === "number" && Number.isFinite(value);
+    if (typeof def === "boolean") return typeof value === "boolean";
+    if (Array.isArray(def)) return Array.isArray(value) || typeof value === "string";
+    if (def && typeof def === "object") return !!value && typeof value === "object";
+    // Unknown widget type: accept anything except the empty-object placeholder
+    // older saves wrote for string fields.
+    return !(value && typeof value === "object" && !Array.isArray(value)
+        && Object.keys(value).length === 0);
+}
+
 function legacyDirectorWidgetValues(values) {
     const prefix = ["task_type", "global_prompt", "cfg", "seed", "control_after_generate",
         "frame_rate", "width", "height", "ref_max_size", "total_frames", "timeline_data",
@@ -668,6 +712,7 @@ function legacyDirectorWidgetValues(values) {
 function restoreDirectorWidgetsFromSaved(node, data) {
     if (!node || !data) return false;
     let named = data.widgets_values_named;
+    const positional = Array.isArray(data.widgets_values) ? data.widgets_values : null;
     if (!named || typeof named !== "object" || Array.isArray(named)) {
         const values = data.widgets_values;
         if (!Array.isArray(values) || !values.length) return false;
@@ -679,10 +724,26 @@ function restoreDirectorWidgetsFromSaved(node, data) {
     }
     node._mmxRestoringSampleWidgets = true;
     try {
+        // Widget order matches widgets_values, so a positional fallback exists
+        // whenever widgets_values_named has a stale/placeholder entry.
+        const positionalByName = {};
+        if (Array.isArray(positional)) {
+            for (const w of directorValueWidgets(node)) {
+                const idx = (node.widgets || []).indexOf(w);
+                if (idx !== -1 && idx < positional.length && positional[idx] !== undefined)
+                    positionalByName[w.name] = positional[idx];
+            }
+        }
         for (const w of directorValueWidgets(node)) {
-            const hasValue = Object.prototype.hasOwnProperty.call(named, w.name) && named[w.name] !== undefined;
+            const namedValue = Object.prototype.hasOwnProperty.call(named, w.name) ? named[w.name] : undefined;
+            let value = namedValue;
+            if (!isUsableDirectorValue(w.name, namedValue, w, null)) {
+                const posValue = positionalByName[w.name];
+                if (isUsableDirectorValue(w.name, posValue, w, null)) value = posValue;
+                else value = undefined;
+            }
             const def = node._mmxDeclaredWidgetDefaults?.[w.name] ?? w.options?.default;
-            if (hasValue) w.value = named[w.name];
+            if (value !== undefined) w.value = value;
             else if (def !== undefined) w.value = def;
         }
         const family = widgetByName(node, "generation_family");
@@ -2103,7 +2164,9 @@ function parseTimeline(raw, totalFrames, fps) {
         batchDetailMode: "solo",
         segments: [{ id: uid(), start: 0, length: total, prompt: "", taskType: "", refs: [], refAudios: [], referenceVideo: {} }],
     };
-    if (!raw?.trim()) return base;
+    // Defensive: older saves could contain a non-string placeholder here.
+    // Keep the default base for it instead of throwing on `raw.trim`.
+    if (typeof raw !== "string" || !raw.trim()) return base;
     try {
         const data = JSON.parse(raw);
         data.version = data.version || 4;
